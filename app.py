@@ -43,10 +43,21 @@ def fetch_series(flow: str, key: str) -> pd.Series:
     data.columns = data.columns.str.strip().str.upper()
     if "TIME_PERIOD" not in data or "OBS_VALUE" not in data:
         raise RuntimeError(f"Unexpected IMF response columns for {flow}: {list(data.columns)}")
-    period = pd.to_datetime(data["TIME_PERIOD"].astype(str).str[:7] + "-01", errors="coerce")
+    # IMF SDMX monthly TIME_PERIOD is YYYY-MMM (e.g. 2000-M01).
+    # Parse exact monthly labels; do not truncate to 7 characters because
+    # YYYY-M01 becomes YYYY-M0 and may be misinterpreted by pandas.
+    raw_period = data["TIME_PERIOD"].astype("string").str.strip()
+    standard_period = raw_period.str.replace(r"^(\d{4})-M(0[1-9]|1[0-2])$", r"\1-\2", regex=True)
+    matches_month = standard_period.str.fullmatch(r"\d{4}-(0[1-9]|1[0-2])")
+    if not bool(matches_month.fillna(False).all()):
+        examples = raw_period[~matches_month.fillna(False)].dropna().head(5).tolist()
+        raise RuntimeError(f"Unexpected/non-monthly IMF TIME_PERIOD for {flow}/{key}: {examples}")
+    period = pd.to_datetime(standard_period + "-01", format="%Y-%m-%d", errors="raise")
     values = pd.to_numeric(data["OBS_VALUE"], errors="coerce")
-    series = pd.Series(values.to_numpy(), index=period, dtype=float)
-    series = series[series.index.notna()].groupby(level=0).last().sort_index()
+    series = pd.Series(values.to_numpy(), index=pd.DatetimeIndex(period), dtype=float)
+    if series.index.has_duplicates:
+        raise RuntimeError(f"Duplicate IMF monthly periods for {flow}/{key}; inspect the API response.")
+    series = series.sort_index()
     series = series[series.index >= EARLIEST.to_timestamp()]
     if series.dropna().empty:
         raise RuntimeError(f"No usable monthly observations for {flow} / {key}.")
@@ -127,6 +138,9 @@ m1, m2, m3 = st.columns(3)
 m1.metric("Sample mean RER (RER*)", f"{rer_star:.5g}")
 m2.metric("Valid real observations", f"{complete.sum():,}")
 m3.metric("Period", f"{start_m} to {end_m}")
+expected_months = len(pd.period_range(start_m, end_m, freq="M"))
+st.caption(f"Monthly coverage: {complete.sum()} valid observations out of {expected_months} calendar months "
+           f"({100 * complete.sum() / expected_months:.1f}%). Missing months are not imputed.")
 
 fig = make_subplots(specs=[[{"secondary_y": True}]])
 if view in ("Real", "Both"):
